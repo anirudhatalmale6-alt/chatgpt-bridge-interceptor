@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      2.0.0
+// @version      2.1.0
 // @description  Intercepts outgoing /backend-api/conversation requests at the network layer and prepends context from Laravel backend as a system message. Zero DOM manipulation.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
@@ -19,6 +19,7 @@
   const X_AGENT_KEY  = 'PLACEHOLDER_KEY';  // Replace with real key
   const TIMEOUT_MS   = 8000;
   const USER_ID      = 'bridge-user';
+  const MEMORY_TOKEN = /\/remember/i;  // Exact trigger token, case-insensitive
   // ===============================================================
 
   // Session ID — persistent across page loads
@@ -51,8 +52,15 @@
     return '';
   }
 
+  // Check for /remember trigger token. Returns { stripped, writeMemory }.
+  function parseMemoryTrigger(text) {
+    const hasToken = MEMORY_TOKEN.test(text);
+    const stripped = hasToken ? text.replace(MEMORY_TOKEN, '').trim() : text;
+    return { stripped, writeMemory: hasToken };
+  }
+
   // Fetch context from the Laravel backend using GM_xmlhttpRequest (bypasses CORS)
-  function fetchContext(messageText) {
+  function fetchContext(messageText, writeMemory) {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('bridge timeout')), TIMEOUT_MS);
 
@@ -67,7 +75,7 @@
           user_id: USER_ID,
           session_id: SESSION_ID,
           message: messageText,
-          write_memory: true,
+          write_memory: writeMemory,
         }),
         onload(res) {
           clearTimeout(timer);
@@ -134,14 +142,31 @@
     }
 
     // Extract user message
-    const userMessage = extractUserMessage(body);
-    if (!userMessage) {
+    const rawUserMessage = extractUserMessage(body);
+    if (!rawUserMessage) {
       // No user message found — pass through unchanged
       return originalFetch.call(this, input, init);
     }
 
+    // Parse memory trigger token
+    const { stripped: userMessage, writeMemory } = parseMemoryTrigger(rawUserMessage);
+
+    // If trigger token was present, strip it from the ChatGPT payload too
+    if (writeMemory) {
+      for (let i = body.messages.length - 1; i >= 0; i--) {
+        const msg = body.messages[i];
+        if (msg.author && msg.author.role === 'user' && msg.content && msg.content.parts) {
+          msg.content.parts = msg.content.parts.map(function (p) {
+            return typeof p === 'string' ? p.replace(MEMORY_TOKEN, '').trim() : p;
+          });
+          break;
+        }
+      }
+      console.log('[Bridge] MEMORY WRITE REQUESTED — /remember token detected and stripped');
+    }
+
     // ONE-CALL SANITY: Dedup guard
-    const hash = messageHash(userMessage);
+    const hash = messageHash(rawUserMessage);
     if (pendingRequests.has(hash)) {
       // Already processing this exact message — pass through
       return originalFetch.call(this, input, init);
@@ -151,8 +176,8 @@
 
     try {
       // Fetch context from Laravel backend (exactly one call)
-      console.log('[Bridge] Intercepted /backend-api/conversation — fetching context...');
-      const context = await fetchContext(userMessage);
+      console.log('[Bridge] Intercepted /backend-api/conversation — fetching context (write_memory: ' + writeMemory + ')...');
+      const context = await fetchContext(userMessage, writeMemory);
 
       // IMMUTABILITY: Insert the context as-is, no trimming or alteration
       // Create a system message in ChatGPT's expected format
@@ -183,5 +208,6 @@
     return originalFetch.call(this, input, init);
   };
 
-  console.log('[Bridge] ChatGPT Network Interceptor v2.0.0 loaded — fetch override active');
+  console.log('[Bridge] ChatGPT Network Interceptor v2.1.0 loaded — fetch override active');
+  console.log('[Bridge] Memory gate: type /remember anywhere in your message to trigger a memory write');
 })();
