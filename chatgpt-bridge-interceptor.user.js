@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      2.1.0
+// @version      2.2.0
 // @description  Intercepts outgoing /backend-api/conversation requests at the network layer and prepends context from Laravel backend as a system message. Zero DOM manipulation.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
@@ -19,7 +19,7 @@
   const X_AGENT_KEY  = 'PLACEHOLDER_KEY';  // Replace with real key
   const TIMEOUT_MS   = 8000;
   const USER_ID      = 'bridge-user';
-  const MEMORY_TOKEN = /\/remember/i;  // Exact trigger token, case-insensitive
+  const MEMORY_TOKEN = /(^|\s)\/remember(?=\s|$)/gi;  // Standalone token only, case-insensitive, global
   // ===============================================================
 
   // Session ID — persistent across page loads
@@ -53,10 +53,14 @@
   }
 
   // Check for /remember trigger token. Returns { stripped, writeMemory }.
+  // Strips ALL standalone occurrences and normalizes whitespace.
   function parseMemoryTrigger(text) {
+    MEMORY_TOKEN.lastIndex = 0;  // Reset regex state (global flag)
     const hasToken = MEMORY_TOKEN.test(text);
-    const stripped = hasToken ? text.replace(MEMORY_TOKEN, '').trim() : text;
-    return { stripped, writeMemory: hasToken };
+    if (!hasToken) return { stripped: text, writeMemory: false };
+    MEMORY_TOKEN.lastIndex = 0;  // Reset again after test()
+    const stripped = text.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
+    return { stripped, writeMemory: true };
   }
 
   // Fetch context from the Laravel backend using GM_xmlhttpRequest (bypasses CORS)
@@ -157,7 +161,9 @@
         const msg = body.messages[i];
         if (msg.author && msg.author.role === 'user' && msg.content && msg.content.parts) {
           msg.content.parts = msg.content.parts.map(function (p) {
-            return typeof p === 'string' ? p.replace(MEMORY_TOKEN, '').trim() : p;
+            if (typeof p !== 'string') return p;
+            MEMORY_TOKEN.lastIndex = 0;
+            return p.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
           });
           break;
         }
@@ -208,6 +214,6 @@
     return originalFetch.call(this, input, init);
   };
 
-  console.log('[Bridge] ChatGPT Network Interceptor v2.1.0 loaded — fetch override active');
+  console.log('[Bridge] ChatGPT Network Interceptor v2.2.0 loaded — fetch override active');
   console.log('[Bridge] Memory gate: type /remember anywhere in your message to trigger a memory write');
 })();
