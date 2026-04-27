@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      2.2.0
-// @description  Intercepts outgoing /backend-api/conversation requests at the network layer and prepends context from Laravel backend as a system message. Zero DOM manipulation.
+// @version      3.0.0
+// @description  Pure context pipeline: intercepts /backend-api/conversation, fetches raw context (time+memory+identity) from Laravel, injects as system message. ChatGPT operates with bridge context natively.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -214,6 +214,6 @@
     return originalFetch.call(this, input, init);
   };
 
-  console.log('[Bridge] ChatGPT Network Interceptor v2.2.0 loaded — fetch override active');
+  console.log('[Bridge] ChatGPT Network Interceptor v3.0.0 loaded — pure context pipeline active');
   console.log('[Bridge] Memory gate: type /remember anywhere in your message to trigger a memory write');
 })();
