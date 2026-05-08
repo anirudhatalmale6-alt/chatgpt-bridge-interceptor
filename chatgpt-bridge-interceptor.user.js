@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      3.1.0
-// @description  Pure context pipeline: intercepts /backend-api/conversation via unsafeWindow.fetch, fetches raw context from Laravel, injects as system message. CSP-safe.
+// @version      3.2.0
+// @description  Pure context pipeline: intercepts /backend-api/conversation via unsafeWindow.fetch, handles all body types (string, ReadableStream, Blob, Request). CSP-safe.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -16,23 +16,18 @@
   'use strict';
 
   // ======================== CONFIGURATION ========================
-  const API_ENDPOINT = 'https://midnightswitchboard.net/api/chat';
-  const X_AGENT_KEY  = 'PLACEHOLDER_KEY';  // Replace with real key
-  const TIMEOUT_MS   = 8000;
-  const USER_ID      = 'bridge-user';
-  const MEMORY_TOKEN = /(^|\s)\/remember(?=\s|$)/gi;
+  var API_ENDPOINT = 'https://midnightswitchboard.net/api/chat';
+  var X_AGENT_KEY  = 'PLACEHOLDER_KEY';  // Replace with real key
+  var TIMEOUT_MS   = 8000;
+  var USER_ID      = 'bridge-user';
+  var MEMORY_TOKEN = /(^|\s)\/remember(?=\s|$)/gi;
   // ===============================================================
 
-  const LOG = function (msg) { console.log('[Bridge] ' + msg); };
-  const WARN = function (msg) { console.warn('[Bridge] ' + msg); };
+  function LOG(msg) { console.log('[Bridge] ' + msg); }
+  function WARN(msg) { console.warn('[Bridge] ' + msg); }
 
-  // Session ID — persistent across page loads
-  let SESSION_ID;
-  try {
-    SESSION_ID = localStorage.getItem('bridge_session_id');
-  } catch (e) {
-    SESSION_ID = null;
-  }
+  var SESSION_ID;
+  try { SESSION_ID = localStorage.getItem('bridge_session_id'); } catch (e) {}
   if (!SESSION_ID) {
     SESSION_ID = 'Steer-Primary-Context';
     try { localStorage.setItem('bridge_session_id', SESSION_ID); } catch (e) {}
@@ -40,31 +35,45 @@
 
   function uuidv4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
-      const r = (Math.random() * 16) | 0;
+      var r = (Math.random() * 16) | 0;
       return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
     });
   }
 
   function extractUserMessage(payload) {
-    if (!payload || !payload.messages || !payload.messages.length) return '';
-    for (let i = payload.messages.length - 1; i >= 0; i--) {
-      const msg = payload.messages[i];
-      if (msg.author && msg.author.role === 'user') {
+    if (!payload || !payload.messages || !Array.isArray(payload.messages)) {
+      LOG('  extractUserMessage: no messages array found');
+      if (payload && payload.message && payload.message.content && payload.message.content.parts) {
+        LOG('  extractUserMessage: found singular message.content.parts');
+        return payload.message.content.parts.join('\n');
+      }
+      return '';
+    }
+    LOG('  extractUserMessage: messages array has ' + payload.messages.length + ' items');
+    for (var i = payload.messages.length - 1; i >= 0; i--) {
+      var msg = payload.messages[i];
+      var role = (msg.author && msg.author.role) || msg.role || '';
+      LOG('  extractUserMessage: [' + i + '] role=' + role);
+      if (role === 'user') {
         if (msg.content && msg.content.parts && msg.content.parts.length > 0) {
           return msg.content.parts.join('\n');
         }
+        if (msg.content && typeof msg.content === 'string') {
+          return msg.content;
+        }
       }
     }
+    LOG('  extractUserMessage: no user message found in any format');
     return '';
   }
 
   function parseMemoryTrigger(text) {
     MEMORY_TOKEN.lastIndex = 0;
-    const hasToken = MEMORY_TOKEN.test(text);
+    var hasToken = MEMORY_TOKEN.test(text);
     if (!hasToken) return { stripped: text, writeMemory: false };
     MEMORY_TOKEN.lastIndex = 0;
-    const stripped = text.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
-    return { stripped, writeMemory: true };
+    var stripped = text.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
+    return { stripped: stripped, writeMemory: true };
   }
 
   function fetchContext(messageText, writeMemory) {
@@ -92,7 +101,7 @@
           clearTimeout(timer);
           LOG('Backend responded: HTTP ' + res.status);
           if (res.status !== 200) {
-            WARN('Backend returned HTTP ' + res.status + ': ' + res.responseText.substring(0, 200));
+            WARN('Backend HTTP ' + res.status + ': ' + (res.responseText || '').substring(0, 200));
             reject(new Error('backend HTTP ' + res.status));
             return;
           }
@@ -102,21 +111,91 @@
               LOG('Context received (' + body.injected_context.length + ' chars)');
               resolve(body.injected_context);
             } else {
-              WARN('Backend returned success=' + body.success + ', context empty=' + !body.injected_context);
+              WARN('Backend success=' + body.success + ', context empty=' + !body.injected_context);
               reject(new Error('backend returned success=false or empty context'));
             }
           } catch (e) {
-            WARN('Could not parse backend response: ' + res.responseText.substring(0, 200));
+            WARN('Parse error: ' + (res.responseText || '').substring(0, 200));
             reject(new Error('bridge parse error: ' + e.message));
           }
         },
-        onerror: function (err) {
+        onerror: function () {
           clearTimeout(timer);
           WARN('GM_xmlhttpRequest network error');
           reject(new Error('bridge network error'));
         },
       });
     });
+  }
+
+  // Read body from any source type: string, ReadableStream, Blob, ArrayBuffer, Request
+  async function readBody(input, init, pw) {
+    // 1. Try init.body first (most common)
+    if (init && init.body != null) {
+      var b = init.body;
+      var btype = typeof b;
+      LOG('Body source: init.body (type: ' + btype + ', constructor: ' + (b.constructor && b.constructor.name || 'unknown') + ')');
+
+      if (btype === 'string') return b;
+
+      // ReadableStream
+      if (b instanceof pw.ReadableStream || (b.getReader && typeof b.getReader === 'function')) {
+        LOG('Reading body from ReadableStream...');
+        try {
+          var reader = b.getReader();
+          var chunks = [];
+          while (true) {
+            var result = await reader.read();
+            if (result.done) break;
+            chunks.push(result.value);
+          }
+          var decoder = new TextDecoder();
+          var text = chunks.map(function (c) { return decoder.decode(c, { stream: true }); }).join('');
+          LOG('ReadableStream body read: ' + text.length + ' chars');
+          return text;
+        } catch (e) {
+          WARN('ReadableStream read failed: ' + e.message);
+          return null;
+        }
+      }
+
+      // Blob
+      if (b instanceof Blob || (pw.Blob && b instanceof pw.Blob)) {
+        LOG('Reading body from Blob...');
+        try { return await b.text(); } catch (e) { WARN('Blob read failed: ' + e.message); return null; }
+      }
+
+      // ArrayBuffer / TypedArray
+      if (b instanceof ArrayBuffer || (pw.ArrayBuffer && b instanceof pw.ArrayBuffer)) {
+        LOG('Reading body from ArrayBuffer...');
+        try { return new TextDecoder().decode(b); } catch (e) { WARN('ArrayBuffer decode failed: ' + e.message); return null; }
+      }
+      if (ArrayBuffer.isView(b)) {
+        LOG('Reading body from TypedArray...');
+        try { return new TextDecoder().decode(b); } catch (e) { WARN('TypedArray decode failed: ' + e.message); return null; }
+      }
+
+      // Last resort: try toString
+      LOG('Body is unknown type, trying toString...');
+      try { return b.toString(); } catch (e) { return null; }
+    }
+
+    // 2. Try reading from Request object
+    if (input && (typeof pw.Request !== 'undefined') && (input instanceof pw.Request || input instanceof Request)) {
+      LOG('Body source: Request object');
+      try {
+        var cloned = input.clone();
+        var reqText = await cloned.text();
+        LOG('Request body read: ' + reqText.length + ' chars');
+        return reqText;
+      } catch (e) {
+        WARN('Request.clone().text() failed: ' + e.message);
+        return null;
+      }
+    }
+
+    LOG('No body found in init or input');
+    return null;
   }
 
   var pendingRequests = new Set();
@@ -130,103 +209,113 @@
   }
 
   // ======================== FETCH OVERRIDE ========================
-  // CRITICAL: Use unsafeWindow to override the PAGE's fetch, not the sandbox's.
-  // With @grant GM_xmlhttpRequest, Tampermonkey sandboxes the script.
-  // window.fetch in the sandbox is NOT the same as the page's fetch.
-  // ChatGPT's React code uses the page's fetch, so we must override there.
-
   var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
   var originalFetch = pageWindow.fetch.bind(pageWindow);
 
   pageWindow.fetch = async function (input, init) {
+    // Determine URL
     var url = '';
     if (typeof input === 'string') {
       url = input;
-    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
+    } else if (input && typeof input === 'object' && input.url) {
       url = input.url;
     } else if (input && input.toString) {
       url = input.toString();
     }
 
-    var isConversation = url.indexOf('/backend-api/conversation') !== -1;
-    var isPost = false;
+    // Scope check
+    if (url.indexOf('/backend-api/conversation') === -1) {
+      return originalFetch(input, init);
+    }
 
-    // Check method from init or from Request object
+    // Method check — be lenient: if we can't determine method, assume POST for conversation endpoint
+    var method = 'UNKNOWN';
     if (init && init.method) {
-      isPost = init.method.toUpperCase() === 'POST';
-    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
-      isPost = (input.method || '').toUpperCase() === 'POST';
+      method = init.method.toUpperCase();
+    } else if (input && typeof input === 'object' && input.method) {
+      method = input.method.toUpperCase();
+    } else {
+      method = 'ASSUMED-POST';
     }
 
-    if (!isConversation || !isPost) {
+    if (method !== 'POST' && method !== 'ASSUMED-POST') {
       return originalFetch(input, init);
     }
 
-    LOG('Intercepted POST to: ' + url);
+    LOG('--- INTERCEPT START ---');
+    LOG('URL: ' + url);
+    LOG('Method: ' + method);
 
-    // Get the body — could be in init.body or in the Request object
-    var rawBody = null;
-    if (init && init.body) {
-      rawBody = init.body;
-    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
-      try {
-        rawBody = await input.clone().text();
-      } catch (e) {
-        WARN('Could not read Request body: ' + e.message);
-      }
-    }
+    // Read body from whatever source
+    var bodyText = await readBody(input, init, pageWindow);
 
-    if (!rawBody) {
-      WARN('No body found, passing through');
+    if (!bodyText) {
+      WARN('Could not read body from any source, passing through');
+      LOG('--- INTERCEPT END (no body) ---');
       return originalFetch(input, init);
     }
+
+    LOG('Raw body length: ' + bodyText.length + ' chars');
+    LOG('Body preview: ' + bodyText.substring(0, 150) + '...');
 
     var body;
     try {
-      body = JSON.parse(rawBody);
+      body = JSON.parse(bodyText);
     } catch (e) {
-      WARN('Could not parse request body as JSON, passing through');
+      WARN('Body is not valid JSON: ' + e.message);
+      LOG('--- INTERCEPT END (bad JSON) ---');
       return originalFetch(input, init);
     }
 
+    LOG('Parsed payload keys: ' + Object.keys(body).join(', '));
+    LOG('Action: ' + (body.action || 'none'));
+
+    // Extract user message
     var rawUserMessage = extractUserMessage(body);
     if (!rawUserMessage) {
-      LOG('No user message in payload (action: ' + (body.action || 'unknown') + '), passing through');
+      LOG('No user message extracted, passing through');
+      LOG('--- INTERCEPT END (no user msg) ---');
       return originalFetch(input, init);
     }
 
-    LOG('User message: "' + rawUserMessage.substring(0, 60) + (rawUserMessage.length > 60 ? '...' : '') + '"');
+    LOG('User message: "' + rawUserMessage.substring(0, 80) + (rawUserMessage.length > 80 ? '...' : '') + '"');
 
+    // Memory trigger
     var memResult = parseMemoryTrigger(rawUserMessage);
     var userMessage = memResult.stripped;
     var writeMemory = memResult.writeMemory;
 
     if (writeMemory) {
-      for (var i = body.messages.length - 1; i >= 0; i--) {
-        var msg = body.messages[i];
-        if (msg.author && msg.author.role === 'user' && msg.content && msg.content.parts) {
-          msg.content.parts = msg.content.parts.map(function (p) {
-            if (typeof p !== 'string') return p;
-            MEMORY_TOKEN.lastIndex = 0;
-            return p.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
-          });
-          break;
+      if (body.messages && Array.isArray(body.messages)) {
+        for (var i = body.messages.length - 1; i >= 0; i--) {
+          var msg = body.messages[i];
+          var role = (msg.author && msg.author.role) || msg.role || '';
+          if (role === 'user' && msg.content && msg.content.parts) {
+            msg.content.parts = msg.content.parts.map(function (p) {
+              if (typeof p !== 'string') return p;
+              MEMORY_TOKEN.lastIndex = 0;
+              return p.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
+            });
+            break;
+          }
         }
       }
-      LOG('MEMORY WRITE REQUESTED — /remember token detected and stripped');
+      LOG('MEMORY WRITE REQUESTED — /remember stripped');
     }
 
+    // Dedup
     var hash = messageHash(rawUserMessage);
     if (pendingRequests.has(hash)) {
-      LOG('Dedup guard: already processing this message, passing through');
+      LOG('Dedup: already processing, passing through');
+      LOG('--- INTERCEPT END (dedup) ---');
       return originalFetch(input, init);
     }
-
     pendingRequests.add(hash);
 
     try {
       var context = await fetchContext(userMessage, writeMemory);
 
+      // Build system message
       var systemMessage = {
         id: uuidv4(),
         author: { role: 'system' },
@@ -237,25 +326,37 @@
         metadata: {},
       };
 
-      body.messages.unshift(systemMessage);
+      // Inject into messages array
+      if (body.messages && Array.isArray(body.messages)) {
+        body.messages.unshift(systemMessage);
+      } else {
+        body.messages = [systemMessage];
+        LOG('Created messages array (was missing)');
+      }
 
       var modifiedBody = JSON.stringify(body);
 
-      // Rebuild init to ensure the modified body is used
-      var newInit = {};
+      // Build clean init with modified body
+      var newInit = { method: 'POST', body: modifiedBody };
       if (init) {
-        for (var key in init) {
-          if (init.hasOwnProperty(key)) {
-            newInit[key] = init[key];
-          }
-        }
+        if (init.headers) newInit.headers = init.headers;
+        if (init.credentials) newInit.credentials = init.credentials;
+        if (init.signal) newInit.signal = init.signal;
+        if (init.mode) newInit.mode = init.mode;
+        if (init.cache) newInit.cache = init.cache;
+        if (init.redirect) newInit.redirect = init.redirect;
+        if (init.referrer) newInit.referrer = init.referrer;
+        if (init.referrerPolicy) newInit.referrerPolicy = init.referrerPolicy;
+        if (init.integrity) newInit.integrity = init.integrity;
+        if (init.keepalive != null) newInit.keepalive = init.keepalive;
       }
-      newInit.body = modifiedBody;
 
-      LOG('Context injected successfully (' + context.length + ' chars). Sending modified request.');
+      LOG('Context injected (' + context.length + ' chars). Sending modified request.');
+      LOG('--- INTERCEPT END (success) ---');
       return originalFetch(url, newInit);
     } catch (err) {
-      WARN('Backend call failed (' + err.message + ') — sending original message (fail-safe)');
+      WARN('Backend failed (' + err.message + ') — sending original (fail-safe)');
+      LOG('--- INTERCEPT END (fail-safe) ---');
     } finally {
       pendingRequests.delete(hash);
     }
@@ -263,7 +364,7 @@
     return originalFetch(input, init);
   };
 
-  LOG('v3.1.0 loaded — pure context pipeline active (unsafeWindow fetch override)');
-  LOG('Memory gate: type /remember anywhere in your message to trigger a memory write');
-  LOG('CSP note: GM_xmlhttpRequest bypasses page CSP. The eval warning is from ChatGPT, not this script.');
+  LOG('v3.2.0 loaded — pure context pipeline (unsafeWindow + all body types)');
+  LOG('Memory gate: /remember triggers write');
+  LOG('CSP eval warning is from ChatGPT, not this script');
 })();
