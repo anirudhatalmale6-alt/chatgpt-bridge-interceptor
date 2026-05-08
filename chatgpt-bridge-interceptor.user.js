@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      3.0.0
-// @description  Pure context pipeline: intercepts /backend-api/conversation, fetches raw context (time+memory+identity) from Laravel, injects as system message. ChatGPT operates with bridge context natively.
+// @version      3.1.0
+// @description  Pure context pipeline: intercepts /backend-api/conversation via unsafeWindow.fetch, fetches raw context from Laravel, injects as system message. CSP-safe.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @grant        GM_xmlhttpRequest
+// @grant        unsafeWindow
 // @connect      midnightswitchboard.net
 // @run-at       document-start
 // ==/UserScript==
@@ -19,17 +20,24 @@
   const X_AGENT_KEY  = 'PLACEHOLDER_KEY';  // Replace with real key
   const TIMEOUT_MS   = 8000;
   const USER_ID      = 'bridge-user';
-  const MEMORY_TOKEN = /(^|\s)\/remember(?=\s|$)/gi;  // Standalone token only, case-insensitive, global
+  const MEMORY_TOKEN = /(^|\s)\/remember(?=\s|$)/gi;
   // ===============================================================
 
+  const LOG = function (msg) { console.log('[Bridge] ' + msg); };
+  const WARN = function (msg) { console.warn('[Bridge] ' + msg); };
+
   // Session ID — persistent across page loads
-  let SESSION_ID = localStorage.getItem('bridge_session_id');
+  let SESSION_ID;
+  try {
+    SESSION_ID = localStorage.getItem('bridge_session_id');
+  } catch (e) {
+    SESSION_ID = null;
+  }
   if (!SESSION_ID) {
     SESSION_ID = 'Steer-Primary-Context';
-    localStorage.setItem('bridge_session_id', SESSION_ID);
+    try { localStorage.setItem('bridge_session_id', SESSION_ID); } catch (e) {}
   }
 
-  // Generate a UUID v4 for injected message IDs
   function uuidv4() {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
       const r = (Math.random() * 16) | 0;
@@ -37,10 +45,8 @@
     });
   }
 
-  // Extract the user's message text from ChatGPT's payload
   function extractUserMessage(payload) {
     if (!payload || !payload.messages || !payload.messages.length) return '';
-    // The last message in the array is typically the user's message
     for (let i = payload.messages.length - 1; i >= 0; i--) {
       const msg = payload.messages[i];
       if (msg.author && msg.author.role === 'user') {
@@ -52,21 +58,22 @@
     return '';
   }
 
-  // Check for /remember trigger token. Returns { stripped, writeMemory }.
-  // Strips ALL standalone occurrences and normalizes whitespace.
   function parseMemoryTrigger(text) {
-    MEMORY_TOKEN.lastIndex = 0;  // Reset regex state (global flag)
+    MEMORY_TOKEN.lastIndex = 0;
     const hasToken = MEMORY_TOKEN.test(text);
     if (!hasToken) return { stripped: text, writeMemory: false };
-    MEMORY_TOKEN.lastIndex = 0;  // Reset again after test()
+    MEMORY_TOKEN.lastIndex = 0;
     const stripped = text.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
     return { stripped, writeMemory: true };
   }
 
-  // Fetch context from the Laravel backend using GM_xmlhttpRequest (bypasses CORS)
   function fetchContext(messageText, writeMemory) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error('bridge timeout')), TIMEOUT_MS);
+    LOG('Calling backend: ' + API_ENDPOINT + ' (write_memory: ' + writeMemory + ')');
+    return new Promise(function (resolve, reject) {
+      var timer = setTimeout(function () {
+        WARN('Backend call timed out after ' + TIMEOUT_MS + 'ms');
+        reject(new Error('bridge timeout'));
+      }, TIMEOUT_MS);
 
       GM_xmlhttpRequest({
         method: 'POST',
@@ -81,84 +88,122 @@
           message: messageText,
           write_memory: writeMemory,
         }),
-        onload(res) {
+        onload: function (res) {
           clearTimeout(timer);
+          LOG('Backend responded: HTTP ' + res.status);
+          if (res.status !== 200) {
+            WARN('Backend returned HTTP ' + res.status + ': ' + res.responseText.substring(0, 200));
+            reject(new Error('backend HTTP ' + res.status));
+            return;
+          }
           try {
-            const body = JSON.parse(res.responseText);
+            var body = JSON.parse(res.responseText);
             if (body.success && body.injected_context) {
+              LOG('Context received (' + body.injected_context.length + ' chars)');
               resolve(body.injected_context);
             } else {
+              WARN('Backend returned success=' + body.success + ', context empty=' + !body.injected_context);
               reject(new Error('backend returned success=false or empty context'));
             }
           } catch (e) {
+            WARN('Could not parse backend response: ' + res.responseText.substring(0, 200));
             reject(new Error('bridge parse error: ' + e.message));
           }
         },
-        onerror() {
+        onerror: function (err) {
           clearTimeout(timer);
+          WARN('GM_xmlhttpRequest network error');
           reject(new Error('bridge network error'));
         },
       });
     });
   }
 
-  // Dedup guard: track in-flight requests by a hash of the user message
-  const pendingRequests = new Set();
+  var pendingRequests = new Set();
 
   function messageHash(text) {
-    let hash = 0;
-    for (let i = 0; i < text.length; i++) {
+    var hash = 0;
+    for (var i = 0; i < text.length; i++) {
       hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
     }
     return hash.toString();
   }
 
   // ======================== FETCH OVERRIDE ========================
-  const originalFetch = window.fetch;
+  // CRITICAL: Use unsafeWindow to override the PAGE's fetch, not the sandbox's.
+  // With @grant GM_xmlhttpRequest, Tampermonkey sandboxes the script.
+  // window.fetch in the sandbox is NOT the same as the page's fetch.
+  // ChatGPT's React code uses the page's fetch, so we must override there.
 
-  window.fetch = async function (input, init) {
-    // Determine the URL
-    let url = '';
+  var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  var originalFetch = pageWindow.fetch.bind(pageWindow);
+
+  pageWindow.fetch = async function (input, init) {
+    var url = '';
     if (typeof input === 'string') {
       url = input;
-    } else if (input instanceof Request) {
+    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
       url = input.url;
     } else if (input && input.toString) {
       url = input.toString();
     }
 
-    // STRICT SCOPE: Only intercept POST to /backend-api/conversation
-    const isConversation = url.includes('/backend-api/conversation');
-    const isPost = init && init.method && init.method.toUpperCase() === 'POST';
+    var isConversation = url.indexOf('/backend-api/conversation') !== -1;
+    var isPost = false;
+
+    // Check method from init or from Request object
+    if (init && init.method) {
+      isPost = init.method.toUpperCase() === 'POST';
+    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
+      isPost = (input.method || '').toUpperCase() === 'POST';
+    }
 
     if (!isConversation || !isPost) {
-      return originalFetch.call(this, input, init);
+      return originalFetch(input, init);
     }
 
-    // Parse the request body
-    let body;
+    LOG('Intercepted POST to: ' + url);
+
+    // Get the body — could be in init.body or in the Request object
+    var rawBody = null;
+    if (init && init.body) {
+      rawBody = init.body;
+    } else if (input instanceof Request || (pageWindow.Request && input instanceof pageWindow.Request)) {
+      try {
+        rawBody = await input.clone().text();
+      } catch (e) {
+        WARN('Could not read Request body: ' + e.message);
+      }
+    }
+
+    if (!rawBody) {
+      WARN('No body found, passing through');
+      return originalFetch(input, init);
+    }
+
+    var body;
     try {
-      body = JSON.parse(init.body);
+      body = JSON.parse(rawBody);
     } catch (e) {
-      // Can't parse body — pass through unchanged (fail-safe)
-      console.warn('[Bridge] Could not parse request body, passing through');
-      return originalFetch.call(this, input, init);
+      WARN('Could not parse request body as JSON, passing through');
+      return originalFetch(input, init);
     }
 
-    // Extract user message
-    const rawUserMessage = extractUserMessage(body);
+    var rawUserMessage = extractUserMessage(body);
     if (!rawUserMessage) {
-      // No user message found — pass through unchanged
-      return originalFetch.call(this, input, init);
+      LOG('No user message in payload (action: ' + (body.action || 'unknown') + '), passing through');
+      return originalFetch(input, init);
     }
 
-    // Parse memory trigger token
-    const { stripped: userMessage, writeMemory } = parseMemoryTrigger(rawUserMessage);
+    LOG('User message: "' + rawUserMessage.substring(0, 60) + (rawUserMessage.length > 60 ? '...' : '') + '"');
 
-    // If trigger token was present, strip it from the ChatGPT payload too
+    var memResult = parseMemoryTrigger(rawUserMessage);
+    var userMessage = memResult.stripped;
+    var writeMemory = memResult.writeMemory;
+
     if (writeMemory) {
-      for (let i = body.messages.length - 1; i >= 0; i--) {
-        const msg = body.messages[i];
+      for (var i = body.messages.length - 1; i >= 0; i--) {
+        var msg = body.messages[i];
         if (msg.author && msg.author.role === 'user' && msg.content && msg.content.parts) {
           msg.content.parts = msg.content.parts.map(function (p) {
             if (typeof p !== 'string') return p;
@@ -168,26 +213,21 @@
           break;
         }
       }
-      console.log('[Bridge] MEMORY WRITE REQUESTED — /remember token detected and stripped');
+      LOG('MEMORY WRITE REQUESTED — /remember token detected and stripped');
     }
 
-    // ONE-CALL SANITY: Dedup guard
-    const hash = messageHash(rawUserMessage);
+    var hash = messageHash(rawUserMessage);
     if (pendingRequests.has(hash)) {
-      // Already processing this exact message — pass through
-      return originalFetch.call(this, input, init);
+      LOG('Dedup guard: already processing this message, passing through');
+      return originalFetch(input, init);
     }
 
     pendingRequests.add(hash);
 
     try {
-      // Fetch context from Laravel backend (exactly one call)
-      console.log('[Bridge] Intercepted /backend-api/conversation — fetching context (write_memory: ' + writeMemory + ')...');
-      const context = await fetchContext(userMessage, writeMemory);
+      var context = await fetchContext(userMessage, writeMemory);
 
-      // IMMUTABILITY: Insert the context as-is, no trimming or alteration
-      // Create a system message in ChatGPT's expected format
-      const systemMessage = {
+      var systemMessage = {
         id: uuidv4(),
         author: { role: 'system' },
         content: {
@@ -197,23 +237,33 @@
         metadata: {},
       };
 
-      // Prepend the system message before the user's message
       body.messages.unshift(systemMessage);
 
-      // Replace the body with the modified payload
-      init.body = JSON.stringify(body);
+      var modifiedBody = JSON.stringify(body);
 
-      console.log('[Bridge] Context injected successfully. Sending modified request.');
+      // Rebuild init to ensure the modified body is used
+      var newInit = {};
+      if (init) {
+        for (var key in init) {
+          if (init.hasOwnProperty(key)) {
+            newInit[key] = init[key];
+          }
+        }
+      }
+      newInit.body = modifiedBody;
+
+      LOG('Context injected successfully (' + context.length + ' chars). Sending modified request.');
+      return originalFetch(url, newInit);
     } catch (err) {
-      // FAIL-SAFE: If backend call fails, send original message unchanged
-      console.warn('[Bridge] Backend call failed (' + err.message + ') — sending original message');
+      WARN('Backend call failed (' + err.message + ') — sending original message (fail-safe)');
     } finally {
       pendingRequests.delete(hash);
     }
 
-    return originalFetch.call(this, input, init);
+    return originalFetch(input, init);
   };
 
-  console.log('[Bridge] ChatGPT Network Interceptor v3.0.0 loaded — pure context pipeline active');
-  console.log('[Bridge] Memory gate: type /remember anywhere in your message to trigger a memory write');
+  LOG('v3.1.0 loaded — pure context pipeline active (unsafeWindow fetch override)');
+  LOG('Memory gate: type /remember anywhere in your message to trigger a memory write');
+  LOG('CSP note: GM_xmlhttpRequest bypasses page CSP. The eval warning is from ChatGPT, not this script.');
 })();
