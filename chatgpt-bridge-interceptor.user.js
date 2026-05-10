@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      3.4.0
-// @description  Diagnostic build: exhaustive logging for ALL conversation requests. Fetch + XHR intercept, action:next injection.
+// @version      3.5.0
+// @description  Aggressive message extraction for all model payloads (gpt-5-4-thinking etc). Fetch + XHR intercept, action:next injection.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -40,36 +40,103 @@
     });
   }
 
+  // Deep-inspect a single message object and try to extract text
+  function getTextFromMessage(msg) {
+    if (!msg) return '';
+    // content.parts[] (standard ChatGPT format)
+    if (msg.content && msg.content.parts && Array.isArray(msg.content.parts)) {
+      var textParts = msg.content.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
+      if (textParts.length > 0) return textParts.join('\n');
+    }
+    // content as string
+    if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
+      return msg.content;
+    }
+    // content.text
+    if (msg.content && msg.content.text && typeof msg.content.text === 'string') {
+      return msg.content.text;
+    }
+    // text field directly on message
+    if (msg.text && typeof msg.text === 'string' && msg.text.trim()) {
+      return msg.text;
+    }
+    // parts at top level of message
+    if (msg.parts && Array.isArray(msg.parts)) {
+      var tp = msg.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
+      if (tp.length > 0) return tp.join('\n');
+    }
+    return '';
+  }
+
   function extractUserMessage(payload) {
+    // Dump full message structure for diagnostics
+    if (payload.messages && Array.isArray(payload.messages)) {
+      LOG('  EXTRACT: messages array has ' + payload.messages.length + ' items');
+      for (var d = 0; d < payload.messages.length; d++) {
+        var dm = payload.messages[d];
+        var dRole = 'none';
+        if (dm.author && dm.author.role) dRole = 'author.role=' + dm.author.role;
+        else if (dm.role) dRole = 'role=' + dm.role;
+        var dContentType = 'none';
+        if (dm.content) {
+          if (typeof dm.content === 'string') dContentType = 'string(' + dm.content.length + ')';
+          else if (dm.content.parts) dContentType = 'parts[' + dm.content.parts.length + ']';
+          else if (dm.content.text) dContentType = 'text(' + dm.content.text.length + ')';
+          else dContentType = 'object(keys:' + Object.keys(dm.content).join(',') + ')';
+        }
+        var dKeys = Object.keys(dm).join(',');
+        LOG('  EXTRACT: [' + d + '] ' + dRole + ' | content: ' + dContentType + ' | keys: ' + dKeys);
+        var dText = getTextFromMessage(dm);
+        if (dText) LOG('  EXTRACT: [' + d + '] text preview: "' + dText.substring(0, 80) + '"');
+      }
+    }
+
+    // Pass 1: Look for role=user (standard)
     if (payload.messages && Array.isArray(payload.messages)) {
       for (var i = payload.messages.length - 1; i >= 0; i--) {
         var msg = payload.messages[i];
         var role = (msg.author && msg.author.role) || msg.role || '';
         if (role === 'user') {
-          if (msg.content && msg.content.parts && msg.content.parts.length > 0) {
-            return msg.content.parts.join('\n');
-          }
-          if (msg.content && typeof msg.content === 'string') {
-            return msg.content;
-          }
+          var text = getTextFromMessage(msg);
+          if (text) { LOG('  EXTRACT: Found via role=user at [' + i + ']'); return text; }
         }
       }
     }
+
+    // Pass 2: Look for any message with text content (last one that has text, skip system/tool)
+    if (payload.messages && Array.isArray(payload.messages)) {
+      for (var j = payload.messages.length - 1; j >= 0; j--) {
+        var msg2 = payload.messages[j];
+        var role2 = (msg2.author && msg2.author.role) || msg2.role || '';
+        if (role2 === 'system' || role2 === 'tool') continue;
+        var text2 = getTextFromMessage(msg2);
+        if (text2) { LOG('  EXTRACT: Found via fallback at [' + j + '] (role=' + role2 + ')'); return text2; }
+      }
+    }
+
+    // Pass 3: ANY message with text, regardless of role
+    if (payload.messages && Array.isArray(payload.messages)) {
+      for (var k = payload.messages.length - 1; k >= 0; k--) {
+        var text3 = getTextFromMessage(payload.messages[k]);
+        if (text3) { LOG('  EXTRACT: Found via any-message at [' + k + ']'); return text3; }
+      }
+    }
+
+    // Pass 4: Singular message object
     if (payload.message) {
-      var m = payload.message;
-      var r = (m.author && m.author.role) || m.role || '';
-      if (r === 'user' || r === '') {
-        if (m.content && m.content.parts && m.content.parts.length > 0) {
-          return m.content.parts.join('\n');
-        }
-        if (m.content && typeof m.content === 'string') {
-          return m.content;
-        }
-      }
+      var text4 = getTextFromMessage(payload.message);
+      if (text4) { LOG('  EXTRACT: Found via payload.message'); return text4; }
     }
+
+    // Pass 5: prompt field
     if (payload.prompt && typeof payload.prompt === 'string') {
+      LOG('  EXTRACT: Found via payload.prompt');
       return payload.prompt;
     }
+
+    // Pass 6: Deep search — look for any string in the payload that looks like user text
+    LOG('  EXTRACT: All passes failed. Dumping payload structure...');
+    try { LOG('  EXTRACT: Full payload: ' + JSON.stringify(payload).substring(0, 500)); } catch (e) {}
     return '';
   }
 
@@ -539,7 +606,7 @@
     });
   };
 
-  LOG('v3.4.0 DIAGNOSTIC loaded — logging ALL conversation requests');
+  LOG('v3.5.0 loaded — aggressive extraction for all model payloads');
   LOG('Watching: fetch + XHR, filter: action:next');
   LOG('Memory gate: /remember triggers write');
 })();
