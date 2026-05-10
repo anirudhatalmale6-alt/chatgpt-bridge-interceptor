@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      3.3.0
-// @description  Pure context pipeline: intercepts /backend-api/conversation (fetch + XHR), targets action:next payloads, injects raw context from Laravel as system message.
+// @version      3.4.0
+// @description  Diagnostic build: exhaustive logging for ALL conversation requests. Fetch + XHR intercept, action:next injection.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -40,9 +40,7 @@
     });
   }
 
-  // Extract user message — tolerant of multiple payload shapes
   function extractUserMessage(payload) {
-    // Shape 1: messages array with author.role
     if (payload.messages && Array.isArray(payload.messages)) {
       for (var i = payload.messages.length - 1; i >= 0; i--) {
         var msg = payload.messages[i];
@@ -57,7 +55,6 @@
         }
       }
     }
-    // Shape 2: singular message object
     if (payload.message) {
       var m = payload.message;
       var r = (m.author && m.author.role) || m.role || '';
@@ -70,7 +67,6 @@
         }
       }
     }
-    // Shape 3: prompt field
     if (payload.prompt && typeof payload.prompt === 'string') {
       return payload.prompt;
     }
@@ -87,11 +83,11 @@
   }
 
   function fetchContext(messageText, writeMemory) {
-    LOG('Calling backend: ' + API_ENDPOINT);
+    LOG('  -> Calling backend: ' + API_ENDPOINT);
     return new Promise(function (resolve, reject) {
       var timer = setTimeout(function () {
-        WARN('Backend timed out after ' + TIMEOUT_MS + 'ms');
-        reject(new Error('bridge timeout'));
+        WARN('  -> Backend timed out');
+        reject(new Error('timeout'));
       }, TIMEOUT_MS);
 
       GM_xmlhttpRequest({
@@ -109,116 +105,278 @@
         }),
         onload: function (res) {
           clearTimeout(timer);
-          LOG('Backend HTTP ' + res.status);
+          LOG('  -> Backend HTTP ' + res.status);
           if (res.status !== 200) {
-            WARN('Backend error: ' + (res.responseText || '').substring(0, 200));
-            reject(new Error('backend HTTP ' + res.status));
+            WARN('  -> Error: ' + (res.responseText || '').substring(0, 300));
+            reject(new Error('HTTP ' + res.status));
             return;
           }
           try {
             var body = JSON.parse(res.responseText);
             if (body.success && body.injected_context) {
-              LOG('Context received (' + body.injected_context.length + ' chars)');
+              LOG('  -> Context: ' + body.injected_context.length + ' chars');
               resolve(body.injected_context);
             } else {
-              WARN('Backend success=' + body.success + ', has context=' + !!body.injected_context);
-              reject(new Error('no context returned'));
+              WARN('  -> No context (success=' + body.success + ')');
+              reject(new Error('no context'));
             }
           } catch (e) {
-            WARN('Response parse error');
-            reject(new Error('parse error'));
+            WARN('  -> Parse error');
+            reject(new Error('parse'));
           }
         },
         onerror: function () {
           clearTimeout(timer);
-          WARN('Network error');
-          reject(new Error('network error'));
+          WARN('  -> Network error');
+          reject(new Error('network'));
         },
       });
     });
   }
 
-  // Convert any body type to string
-  async function bodyToString(body, pw) {
-    if (body == null) return null;
-    if (typeof body === 'string') return body;
-
-    // ReadableStream
-    if (typeof pw.ReadableStream !== 'undefined' && body instanceof pw.ReadableStream) {
-      LOG('  body type: ReadableStream');
-      try {
-        var reader = body.getReader();
-        var chunks = [];
-        while (true) {
-          var r = await reader.read();
-          if (r.done) break;
-          chunks.push(r.value);
-        }
-        return chunks.map(function (c) { return new TextDecoder().decode(c); }).join('');
-      } catch (e) { WARN('  ReadableStream read failed: ' + e.message); return null; }
+  // Describe a value's type in detail
+  function describeType(val) {
+    if (val === null) return 'null';
+    if (val === undefined) return 'undefined';
+    var t = typeof val;
+    if (t === 'string') return 'string(' + val.length + ')';
+    if (t === 'number' || t === 'boolean') return t + '(' + val + ')';
+    if (t === 'object' || t === 'function') {
+      var name = '';
+      try { name = val.constructor ? val.constructor.name : ''; } catch (e) {}
+      if (!name) name = Object.prototype.toString.call(val);
+      return name || t;
     }
-    if (body.getReader && typeof body.getReader === 'function') {
-      LOG('  body type: stream-like (has getReader)');
-      try {
-        var reader2 = body.getReader();
-        var chunks2 = [];
-        while (true) {
-          var r2 = await reader2.read();
-          if (r2.done) break;
-          chunks2.push(r2.value);
-        }
-        return chunks2.map(function (c) { return new TextDecoder().decode(c); }).join('');
-      } catch (e) { WARN('  stream read failed: ' + e.message); return null; }
-    }
-
-    // Blob
-    if ((typeof Blob !== 'undefined' && body instanceof Blob) || (pw.Blob && body instanceof pw.Blob)) {
-      LOG('  body type: Blob');
-      try { return await body.text(); } catch (e) { return null; }
-    }
-
-    // ArrayBuffer
-    if ((typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) || (pw.ArrayBuffer && body instanceof pw.ArrayBuffer)) {
-      LOG('  body type: ArrayBuffer');
-      try { return new TextDecoder().decode(body); } catch (e) { return null; }
-    }
-    if (ArrayBuffer.isView && ArrayBuffer.isView(body)) {
-      LOG('  body type: TypedArray');
-      try { return new TextDecoder().decode(body); } catch (e) { return null; }
-    }
-
-    LOG('  body type: ' + (body.constructor ? body.constructor.name : typeof body) + ' (trying toString)');
-    try { return body.toString(); } catch (e) { return null; }
+    return t;
   }
 
-  // Core injection logic — shared between fetch and XHR intercepts
-  async function processPayload(bodyString) {
+  // Attempt to read body from ANY source, with logging at every step
+  async function readBodyExhaustive(input, init, pw) {
+    var attempts = [];
+
+    // Attempt 1: init.body as string
+    if (init && init.body != null && typeof init.body === 'string') {
+      attempts.push('init.body(string) = SUCCESS');
+      return { text: init.body, attempts: attempts };
+    }
+
+    // Attempt 2: init.body as other type
+    if (init && init.body != null) {
+      var bodyType = describeType(init.body);
+      attempts.push('init.body type: ' + bodyType);
+
+      // ReadableStream (check multiple ways)
+      var isStream = false;
+      try { isStream = (pw.ReadableStream && init.body instanceof pw.ReadableStream); } catch (e) {}
+      if (!isStream) { try { isStream = (init.body.getReader && typeof init.body.getReader === 'function'); } catch (e) {} }
+
+      if (isStream) {
+        attempts.push('init.body is ReadableStream, reading...');
+        try {
+          var reader = init.body.getReader();
+          var chunks = [];
+          while (true) {
+            var r = await reader.read();
+            if (r.done) break;
+            chunks.push(r.value);
+          }
+          var text = chunks.map(function (c) { return new TextDecoder().decode(c); }).join('');
+          attempts.push('ReadableStream read: ' + text.length + ' chars');
+          return { text: text, attempts: attempts };
+        } catch (e) {
+          attempts.push('ReadableStream FAILED: ' + e.message);
+        }
+      }
+
+      // Blob
+      var isBlob = false;
+      try { isBlob = (init.body instanceof Blob) || (pw.Blob && init.body instanceof pw.Blob); } catch (e) {}
+      if (isBlob) {
+        attempts.push('init.body is Blob, reading...');
+        try {
+          var bt = await init.body.text();
+          attempts.push('Blob read: ' + bt.length + ' chars');
+          return { text: bt, attempts: attempts };
+        } catch (e) { attempts.push('Blob FAILED: ' + e.message); }
+      }
+
+      // ArrayBuffer
+      var isAB = false;
+      try { isAB = (init.body instanceof ArrayBuffer) || (pw.ArrayBuffer && init.body instanceof pw.ArrayBuffer); } catch (e) {}
+      if (isAB) {
+        attempts.push('init.body is ArrayBuffer');
+        try {
+          var abt = new TextDecoder().decode(init.body);
+          return { text: abt, attempts: attempts };
+        } catch (e) { attempts.push('ArrayBuffer FAILED: ' + e.message); }
+      }
+
+      // TypedArray
+      try {
+        if (ArrayBuffer.isView && ArrayBuffer.isView(init.body)) {
+          attempts.push('init.body is TypedArray');
+          var tat = new TextDecoder().decode(init.body);
+          return { text: tat, attempts: attempts };
+        }
+      } catch (e) {}
+
+      // toString fallback
+      attempts.push('Trying init.body.toString()...');
+      try {
+        var s = init.body.toString();
+        if (s && s !== '[object Object]' && s !== '[object ReadableStream]') {
+          attempts.push('toString: ' + s.length + ' chars');
+          return { text: s, attempts: attempts };
+        } else {
+          attempts.push('toString unhelpful: "' + s.substring(0, 50) + '"');
+        }
+      } catch (e) { attempts.push('toString FAILED'); }
+    } else {
+      attempts.push('init.body is ' + (init ? describeType(init.body) : 'no init'));
+    }
+
+    // Attempt 3: Read from Request object (input)
+    if (input && typeof input === 'object') {
+      var isRequest = false;
+      try { isRequest = (input instanceof Request); } catch (e) {}
+      if (!isRequest) { try { isRequest = (pw.Request && input instanceof pw.Request); } catch (e) {} }
+      if (!isRequest) { try { isRequest = (typeof input.clone === 'function' && typeof input.text === 'function'); } catch (e) {} }
+
+      if (isRequest) {
+        attempts.push('input is Request, cloning and reading...');
+        try {
+          var cloned = input.clone();
+          var reqText = await cloned.text();
+          attempts.push('Request.text(): ' + reqText.length + ' chars');
+          return { text: reqText, attempts: attempts };
+        } catch (e) { attempts.push('Request.text() FAILED: ' + e.message); }
+
+        // Try arrayBuffer fallback
+        try {
+          var cloned2 = input.clone();
+          var ab = await cloned2.arrayBuffer();
+          var decoded = new TextDecoder().decode(ab);
+          attempts.push('Request.arrayBuffer(): ' + decoded.length + ' chars');
+          return { text: decoded, attempts: attempts };
+        } catch (e) { attempts.push('Request.arrayBuffer() FAILED: ' + e.message); }
+      } else {
+        attempts.push('input is not a Request (type: ' + describeType(input) + ')');
+      }
+    }
+
+    return { text: null, attempts: attempts };
+  }
+
+  // ======================== INTERCEPT SETUP ========================
+  var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+
+  // -------------------- FETCH OVERRIDE --------------------
+  var originalFetch = pageWindow.fetch.bind(pageWindow);
+  var fetchCallCount = 0;
+
+  pageWindow.fetch = async function (input, init) {
+    // Get URL from any input type
+    var url = '';
+    if (typeof input === 'string') {
+      url = input;
+    } else if (input && typeof input === 'object') {
+      try { url = input.url || ''; } catch (e) {}
+    }
+
+    // BROAD MATCH: log anything with "conversation" in URL
+    if (url.indexOf('conversation') === -1) {
+      return originalFetch(input, init);
+    }
+
+    fetchCallCount++;
+    var callId = 'F' + fetchCallCount;
+
+    LOG('========================================');
+    LOG('[' + callId + '] FETCH DETECTED');
+    LOG('[' + callId + '] URL: ' + url);
+    LOG('[' + callId + '] input type: ' + describeType(input));
+    LOG('[' + callId + '] init present: ' + !!init);
+    if (init) {
+      LOG('[' + callId + '] init.method: ' + (init.method || 'undefined'));
+      LOG('[' + callId + '] init.body type: ' + describeType(init.body));
+      LOG('[' + callId + '] init keys: ' + Object.keys(init).join(', '));
+    }
+
+    // Read body
+    var result = await readBodyExhaustive(input, init, pageWindow);
+    LOG('[' + callId + '] Body read attempts:');
+    for (var a = 0; a < result.attempts.length; a++) {
+      LOG('[' + callId + ']   ' + result.attempts[a]);
+    }
+
+    if (!result.text) {
+      WARN('[' + callId + '] BODY READ FAILED — all attempts exhausted, passing through');
+      LOG('========================================');
+      return originalFetch(input, init);
+    }
+
+    LOG('[' + callId + '] Body length: ' + result.text.length);
+    LOG('[' + callId + '] Body preview: ' + result.text.substring(0, 300));
+
+    // Parse JSON
     var body;
     try {
-      body = JSON.parse(bodyString);
+      body = JSON.parse(result.text);
     } catch (e) {
-      LOG('Not valid JSON, skipping');
-      return null;
+      WARN('[' + callId + '] NOT JSON: ' + e.message);
+      LOG('========================================');
+      // Re-send with string body (stream was consumed)
+      var fi = {};
+      if (init) { for (var k in init) { if (k !== 'body') fi[k] = init[k]; } }
+      fi.body = result.text;
+      if (!fi.method) fi.method = 'POST';
+      return originalFetch(url, fi);
     }
 
-    // ONLY process action:"next" — this is the primary user send
-    var action = body.action || '';
+    LOG('[' + callId + '] JSON keys: ' + Object.keys(body).join(', '));
+    LOG('[' + callId + '] action: ' + (body.action === undefined ? 'UNDEFINED' : '"' + body.action + '"'));
+    if (body.messages) {
+      LOG('[' + callId + '] messages: ' + (Array.isArray(body.messages) ? body.messages.length + ' items' : describeType(body.messages)));
+      if (Array.isArray(body.messages)) {
+        for (var mi = 0; mi < body.messages.length; mi++) {
+          var mm = body.messages[mi];
+          var rr = (mm.author && mm.author.role) || mm.role || 'no-role';
+          var preview = '';
+          if (mm.content && mm.content.parts) preview = (mm.content.parts[0] || '').substring(0, 50);
+          else if (mm.content && typeof mm.content === 'string') preview = mm.content.substring(0, 50);
+          LOG('[' + callId + ']   [' + mi + '] role=' + rr + ' content="' + preview + '"');
+        }
+      }
+    }
+    if (body.model) LOG('[' + callId + '] model: ' + body.model);
+
+    // Check if this is a primary send (action: "next")
+    var action = body.action === undefined ? '' : body.action;
     if (action !== 'next') {
-      LOG('Action is "' + action + '" (not "next"), skipping');
-      return null;
+      LOG('[' + callId + '] SKIPPING — action is not "next"');
+      LOG('========================================');
+      var si = {};
+      if (init) { for (var sk in init) { if (sk !== 'body') si[sk] = init[sk]; } }
+      si.body = result.text;
+      if (!si.method) si.method = 'POST';
+      return originalFetch(url, si);
     }
 
-    LOG('ACTION: next — this is a primary user send');
+    // === PRIMARY SEND: action:"next" ===
+    LOG('[' + callId + '] *** PRIMARY SEND DETECTED (action:next) ***');
 
     var rawUserMessage = extractUserMessage(body);
     if (!rawUserMessage) {
-      LOG('No user message found in payload, skipping');
-      LOG('Payload keys: ' + Object.keys(body).join(', '));
-      if (body.messages) LOG('Messages count: ' + body.messages.length);
-      return null;
+      WARN('[' + callId + '] Could not extract user message from payload');
+      LOG('========================================');
+      var ni = {};
+      if (init) { for (var nk in init) { if (nk !== 'body') ni[nk] = init[nk]; } }
+      ni.body = result.text;
+      if (!ni.method) ni.method = 'POST';
+      return originalFetch(url, ni);
     }
 
-    LOG('User message: "' + rawUserMessage.substring(0, 80) + '"');
+    LOG('[' + callId + '] User message: "' + rawUserMessage.substring(0, 100) + '"');
 
     // Memory trigger
     var memResult = parseMemoryTrigger(rawUserMessage);
@@ -238,9 +396,10 @@
           break;
         }
       }
-      LOG('MEMORY WRITE — /remember stripped');
+      LOG('[' + callId + '] /remember stripped');
     }
 
+    // Fetch context and inject
     try {
       var context = await fetchContext(userMessage, writeMemory);
 
@@ -257,68 +416,8 @@
         body.messages = [systemMessage];
       }
 
-      LOG('INJECTED (' + context.length + ' chars)');
-      return JSON.stringify(body);
-    } catch (err) {
-      WARN('Backend failed (' + err.message + ') — fail-safe, no injection');
-      return null;
-    }
-  }
-
-  // ======================== INTERCEPT SETUP ========================
-  var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
-
-  // Track processed requests to avoid double-processing
-  var processedIds = new Set();
-
-  // -------------------- FETCH OVERRIDE --------------------
-  var originalFetch = pageWindow.fetch.bind(pageWindow);
-
-  pageWindow.fetch = async function (input, init) {
-    var url = '';
-    if (typeof input === 'string') {
-      url = input;
-    } else if (input && typeof input === 'object' && input.url) {
-      url = input.url;
-    }
-
-    if (url.indexOf('/backend-api/conversation') === -1) {
-      return originalFetch(input, init);
-    }
-
-    LOG('=== FETCH intercept: ' + url + ' ===');
-
-    // Read body from all possible sources
-    var bodyStr = null;
-
-    // Source 1: init.body
-    if (init && init.body != null) {
-      bodyStr = await bodyToString(init.body, pageWindow);
-      if (bodyStr) LOG('Body from init.body (' + bodyStr.length + ' chars)');
-    }
-
-    // Source 2: Request object
-    if (!bodyStr && input && typeof input === 'object' && input.clone) {
-      try {
-        var cloned = input.clone();
-        bodyStr = await cloned.text();
-        if (bodyStr) LOG('Body from Request.text() (' + bodyStr.length + ' chars)');
-      } catch (e) {
-        WARN('Request body read failed: ' + e.message);
-      }
-    }
-
-    if (!bodyStr) {
-      WARN('No readable body, passing through');
-      return originalFetch(input, init);
-    }
-
-    // Process the payload
-    var modified = await processPayload(bodyStr);
-
-    if (modified) {
-      // Build new init with modified body
-      var newInit = { method: 'POST', body: modified };
+      var modifiedBody = JSON.stringify(body);
+      var newInit = { method: 'POST', body: modifiedBody };
       if (init) {
         if (init.headers) newInit.headers = init.headers;
         if (init.credentials) newInit.credentials = init.credentials;
@@ -331,22 +430,21 @@
         if (init.integrity) newInit.integrity = init.integrity;
         if (init.keepalive != null) newInit.keepalive = init.keepalive;
       }
-      LOG('Sending modified request via fetch');
+
+      LOG('[' + callId + '] INJECTION SUCCESS (' + context.length + ' chars)');
+      LOG('========================================');
       return originalFetch(url, newInit);
+    } catch (err) {
+      WARN('[' + callId + '] Backend failed (' + err.message + ') — fail-safe');
+      LOG('========================================');
     }
 
-    // No modification — send original body (re-create since stream may be consumed)
-    var fallbackInit = {};
-    if (init) {
-      for (var key in init) {
-        if (init.hasOwnProperty(key) && key !== 'body') {
-          fallbackInit[key] = init[key];
-        }
-      }
-    }
-    fallbackInit.body = bodyStr;
-    if (!fallbackInit.method) fallbackInit.method = 'POST';
-    return originalFetch(url, fallbackInit);
+    // Fail-safe: send with original body string
+    var fallback = {};
+    if (init) { for (var fk in init) { if (fk !== 'body') fallback[fk] = init[fk]; } }
+    fallback.body = result.text;
+    if (!fallback.method) fallback.method = 'POST';
+    return originalFetch(url, fallback);
   };
 
   // -------------------- XHR OVERRIDE --------------------
@@ -354,6 +452,7 @@
   var xhrProto = OrigXHR.prototype;
   var origOpen = xhrProto.open;
   var origSend = xhrProto.send;
+  var xhrCallCount = 0;
 
   xhrProto.open = function (method, url) {
     this._bridgeMethod = method;
@@ -364,32 +463,83 @@
   xhrProto.send = function (body) {
     var xhr = this;
     var url = xhr._bridgeUrl || '';
+
+    if (url.indexOf('conversation') === -1) {
+      return origSend.apply(xhr, arguments);
+    }
+
+    xhrCallCount++;
+    var callId = 'X' + xhrCallCount;
     var method = (xhr._bridgeMethod || '').toUpperCase();
 
-    if (url.indexOf('/backend-api/conversation') === -1 || method !== 'POST') {
+    LOG('========================================');
+    LOG('[' + callId + '] XHR DETECTED');
+    LOG('[' + callId + '] URL: ' + url);
+    LOG('[' + callId + '] Method: ' + method);
+    LOG('[' + callId + '] Body type: ' + describeType(body));
+    if (typeof body === 'string') {
+      LOG('[' + callId + '] Body length: ' + body.length);
+      LOG('[' + callId + '] Body preview: ' + body.substring(0, 300));
+    }
+
+    if (method !== 'POST' || typeof body !== 'string') {
+      LOG('[' + callId + '] Not a POST with string body, passing through');
+      LOG('========================================');
       return origSend.apply(xhr, arguments);
     }
 
-    if (typeof body !== 'string') {
-      LOG('=== XHR intercept (non-string body, passing through) ===');
+    // Try to parse and check action
+    var parsed;
+    try { parsed = JSON.parse(body); } catch (e) {
+      LOG('[' + callId + '] Not JSON, passing through');
+      LOG('========================================');
       return origSend.apply(xhr, arguments);
     }
 
-    LOG('=== XHR intercept: ' + url + ' ===');
+    LOG('[' + callId + '] JSON keys: ' + Object.keys(parsed).join(', '));
+    LOG('[' + callId + '] action: ' + (parsed.action === undefined ? 'UNDEFINED' : '"' + parsed.action + '"'));
 
-    processPayload(body).then(function (modified) {
-      if (modified) {
-        LOG('Sending modified request via XHR');
-        origSend.call(xhr, modified);
+    if (parsed.action !== 'next') {
+      LOG('[' + callId + '] Not action:next, passing through');
+      LOG('========================================');
+      return origSend.call(xhr, body);
+    }
+
+    LOG('[' + callId + '] *** PRIMARY SEND (XHR, action:next) ***');
+
+    var rawMsg = extractUserMessage(parsed);
+    LOG('[' + callId + '] User message: "' + (rawMsg || 'NOT FOUND').substring(0, 100) + '"');
+
+    if (!rawMsg) {
+      LOG('========================================');
+      return origSend.call(xhr, body);
+    }
+
+    var mem = parseMemoryTrigger(rawMsg);
+
+    fetchContext(mem.stripped, mem.writeMemory).then(function (context) {
+      var sysMsg = {
+        id: uuidv4(),
+        author: { role: 'system' },
+        content: { content_type: 'text', parts: [context] },
+        metadata: {},
+      };
+      if (parsed.messages && Array.isArray(parsed.messages)) {
+        parsed.messages.unshift(sysMsg);
       } else {
-        origSend.call(xhr, body);
+        parsed.messages = [sysMsg];
       }
+      LOG('[' + callId + '] INJECTION SUCCESS (XHR, ' + context.length + ' chars)');
+      LOG('========================================');
+      origSend.call(xhr, JSON.stringify(parsed));
     }).catch(function (err) {
-      WARN('XHR processing error: ' + err.message);
+      WARN('[' + callId + '] Backend failed: ' + err.message + ' — fail-safe');
+      LOG('========================================');
       origSend.call(xhr, body);
     });
   };
 
-  LOG('v3.3.0 loaded — fetch + XHR intercept, action:next filter');
+  LOG('v3.4.0 DIAGNOSTIC loaded — logging ALL conversation requests');
+  LOG('Watching: fetch + XHR, filter: action:next');
   LOG('Memory gate: /remember triggers write');
 })();
