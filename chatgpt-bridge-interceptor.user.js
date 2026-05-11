@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         ChatGPT Bridge — Network Interceptor
 // @namespace    https://midnightswitchboard.net/bridge
-// @version      3.5.0
-// @description  Aggressive message extraction for all model payloads (gpt-5-4-thinking etc). Fetch + XHR intercept, action:next injection.
+// @version      3.6.0
+// @description  Full traffic diagnostic: logs ALL fetch/XHR URLs, uses defineProperty to prevent fetch override bypass.
 // @author       hezarfen4
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
@@ -40,103 +40,58 @@
     });
   }
 
-  // Deep-inspect a single message object and try to extract text
   function getTextFromMessage(msg) {
     if (!msg) return '';
-    // content.parts[] (standard ChatGPT format)
     if (msg.content && msg.content.parts && Array.isArray(msg.content.parts)) {
-      var textParts = msg.content.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
-      if (textParts.length > 0) return textParts.join('\n');
-    }
-    // content as string
-    if (msg.content && typeof msg.content === 'string' && msg.content.trim()) {
-      return msg.content;
-    }
-    // content.text
-    if (msg.content && msg.content.text && typeof msg.content.text === 'string') {
-      return msg.content.text;
-    }
-    // text field directly on message
-    if (msg.text && typeof msg.text === 'string' && msg.text.trim()) {
-      return msg.text;
-    }
-    // parts at top level of message
-    if (msg.parts && Array.isArray(msg.parts)) {
-      var tp = msg.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
+      var tp = msg.content.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
       if (tp.length > 0) return tp.join('\n');
+    }
+    if (msg.content && typeof msg.content === 'string' && msg.content.trim()) return msg.content;
+    if (msg.content && msg.content.text && typeof msg.content.text === 'string') return msg.content.text;
+    if (msg.text && typeof msg.text === 'string' && msg.text.trim()) return msg.text;
+    if (msg.parts && Array.isArray(msg.parts)) {
+      var tp2 = msg.parts.filter(function (p) { return typeof p === 'string' && p.trim(); });
+      if (tp2.length > 0) return tp2.join('\n');
     }
     return '';
   }
 
   function extractUserMessage(payload) {
-    // Dump full message structure for diagnostics
-    if (payload.messages && Array.isArray(payload.messages)) {
-      LOG('  EXTRACT: messages array has ' + payload.messages.length + ' items');
-      for (var d = 0; d < payload.messages.length; d++) {
-        var dm = payload.messages[d];
-        var dRole = 'none';
-        if (dm.author && dm.author.role) dRole = 'author.role=' + dm.author.role;
-        else if (dm.role) dRole = 'role=' + dm.role;
-        var dContentType = 'none';
-        if (dm.content) {
-          if (typeof dm.content === 'string') dContentType = 'string(' + dm.content.length + ')';
-          else if (dm.content.parts) dContentType = 'parts[' + dm.content.parts.length + ']';
-          else if (dm.content.text) dContentType = 'text(' + dm.content.text.length + ')';
-          else dContentType = 'object(keys:' + Object.keys(dm.content).join(',') + ')';
-        }
-        var dKeys = Object.keys(dm).join(',');
-        LOG('  EXTRACT: [' + d + '] ' + dRole + ' | content: ' + dContentType + ' | keys: ' + dKeys);
-        var dText = getTextFromMessage(dm);
-        if (dText) LOG('  EXTRACT: [' + d + '] text preview: "' + dText.substring(0, 80) + '"');
-      }
-    }
-
-    // Pass 1: Look for role=user (standard)
+    // Pass 1: role=user
     if (payload.messages && Array.isArray(payload.messages)) {
       for (var i = payload.messages.length - 1; i >= 0; i--) {
         var msg = payload.messages[i];
         var role = (msg.author && msg.author.role) || msg.role || '';
         if (role === 'user') {
-          var text = getTextFromMessage(msg);
-          if (text) { LOG('  EXTRACT: Found via role=user at [' + i + ']'); return text; }
+          var t = getTextFromMessage(msg);
+          if (t) return t;
         }
       }
     }
-
-    // Pass 2: Look for any message with text content (last one that has text, skip system/tool)
+    // Pass 2: last message with text, skip system/tool
     if (payload.messages && Array.isArray(payload.messages)) {
       for (var j = payload.messages.length - 1; j >= 0; j--) {
         var msg2 = payload.messages[j];
         var role2 = (msg2.author && msg2.author.role) || msg2.role || '';
         if (role2 === 'system' || role2 === 'tool') continue;
-        var text2 = getTextFromMessage(msg2);
-        if (text2) { LOG('  EXTRACT: Found via fallback at [' + j + '] (role=' + role2 + ')'); return text2; }
+        var t2 = getTextFromMessage(msg2);
+        if (t2) return t2;
       }
     }
-
-    // Pass 3: ANY message with text, regardless of role
+    // Pass 3: any message with text
     if (payload.messages && Array.isArray(payload.messages)) {
       for (var k = payload.messages.length - 1; k >= 0; k--) {
-        var text3 = getTextFromMessage(payload.messages[k]);
-        if (text3) { LOG('  EXTRACT: Found via any-message at [' + k + ']'); return text3; }
+        var t3 = getTextFromMessage(payload.messages[k]);
+        if (t3) return t3;
       }
     }
-
-    // Pass 4: Singular message object
+    // Pass 4: singular message
     if (payload.message) {
-      var text4 = getTextFromMessage(payload.message);
-      if (text4) { LOG('  EXTRACT: Found via payload.message'); return text4; }
+      var t4 = getTextFromMessage(payload.message);
+      if (t4) return t4;
     }
-
-    // Pass 5: prompt field
-    if (payload.prompt && typeof payload.prompt === 'string') {
-      LOG('  EXTRACT: Found via payload.prompt');
-      return payload.prompt;
-    }
-
-    // Pass 6: Deep search — look for any string in the payload that looks like user text
-    LOG('  EXTRACT: All passes failed. Dumping payload structure...');
-    try { LOG('  EXTRACT: Full payload: ' + JSON.stringify(payload).substring(0, 500)); } catch (e) {}
+    // Pass 5: prompt
+    if (payload.prompt && typeof payload.prompt === 'string') return payload.prompt;
     return '';
   }
 
@@ -150,463 +105,313 @@
   }
 
   function fetchContext(messageText, writeMemory) {
-    LOG('  -> Calling backend: ' + API_ENDPOINT);
     return new Promise(function (resolve, reject) {
-      var timer = setTimeout(function () {
-        WARN('  -> Backend timed out');
-        reject(new Error('timeout'));
-      }, TIMEOUT_MS);
-
+      var timer = setTimeout(function () { reject(new Error('timeout')); }, TIMEOUT_MS);
       GM_xmlhttpRequest({
         method: 'POST',
         url: API_ENDPOINT,
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Agent-Key': X_AGENT_KEY,
-        },
+        headers: { 'Content-Type': 'application/json', 'X-Agent-Key': X_AGENT_KEY },
         data: JSON.stringify({
-          user_id: USER_ID,
-          session_id: SESSION_ID,
-          message: messageText,
-          write_memory: writeMemory,
+          user_id: USER_ID, session_id: SESSION_ID,
+          message: messageText, write_memory: writeMemory,
         }),
         onload: function (res) {
           clearTimeout(timer);
-          LOG('  -> Backend HTTP ' + res.status);
-          if (res.status !== 200) {
-            WARN('  -> Error: ' + (res.responseText || '').substring(0, 300));
-            reject(new Error('HTTP ' + res.status));
-            return;
-          }
+          if (res.status !== 200) { reject(new Error('HTTP ' + res.status)); return; }
           try {
             var body = JSON.parse(res.responseText);
-            if (body.success && body.injected_context) {
-              LOG('  -> Context: ' + body.injected_context.length + ' chars');
-              resolve(body.injected_context);
-            } else {
-              WARN('  -> No context (success=' + body.success + ')');
-              reject(new Error('no context'));
-            }
-          } catch (e) {
-            WARN('  -> Parse error');
-            reject(new Error('parse'));
-          }
+            if (body.success && body.injected_context) { resolve(body.injected_context); }
+            else { reject(new Error('no context')); }
+          } catch (e) { reject(new Error('parse')); }
         },
-        onerror: function () {
-          clearTimeout(timer);
-          WARN('  -> Network error');
-          reject(new Error('network'));
-        },
+        onerror: function () { clearTimeout(timer); reject(new Error('network')); },
       });
     });
   }
 
-  // Describe a value's type in detail
-  function describeType(val) {
-    if (val === null) return 'null';
-    if (val === undefined) return 'undefined';
-    var t = typeof val;
-    if (t === 'string') return 'string(' + val.length + ')';
-    if (t === 'number' || t === 'boolean') return t + '(' + val + ')';
-    if (t === 'object' || t === 'function') {
-      var name = '';
-      try { name = val.constructor ? val.constructor.name : ''; } catch (e) {}
-      if (!name) name = Object.prototype.toString.call(val);
-      return name || t;
-    }
-    return t;
-  }
-
-  // Attempt to read body from ANY source, with logging at every step
-  async function readBodyExhaustive(input, init, pw) {
-    var attempts = [];
-
-    // Attempt 1: init.body as string
-    if (init && init.body != null && typeof init.body === 'string') {
-      attempts.push('init.body(string) = SUCCESS');
-      return { text: init.body, attempts: attempts };
-    }
-
-    // Attempt 2: init.body as other type
-    if (init && init.body != null) {
-      var bodyType = describeType(init.body);
-      attempts.push('init.body type: ' + bodyType);
-
-      // ReadableStream (check multiple ways)
-      var isStream = false;
-      try { isStream = (pw.ReadableStream && init.body instanceof pw.ReadableStream); } catch (e) {}
-      if (!isStream) { try { isStream = (init.body.getReader && typeof init.body.getReader === 'function'); } catch (e) {} }
-
-      if (isStream) {
-        attempts.push('init.body is ReadableStream, reading...');
-        try {
-          var reader = init.body.getReader();
-          var chunks = [];
-          while (true) {
-            var r = await reader.read();
-            if (r.done) break;
-            chunks.push(r.value);
-          }
-          var text = chunks.map(function (c) { return new TextDecoder().decode(c); }).join('');
-          attempts.push('ReadableStream read: ' + text.length + ' chars');
-          return { text: text, attempts: attempts };
-        } catch (e) {
-          attempts.push('ReadableStream FAILED: ' + e.message);
-        }
-      }
-
-      // Blob
-      var isBlob = false;
-      try { isBlob = (init.body instanceof Blob) || (pw.Blob && init.body instanceof pw.Blob); } catch (e) {}
-      if (isBlob) {
-        attempts.push('init.body is Blob, reading...');
-        try {
-          var bt = await init.body.text();
-          attempts.push('Blob read: ' + bt.length + ' chars');
-          return { text: bt, attempts: attempts };
-        } catch (e) { attempts.push('Blob FAILED: ' + e.message); }
-      }
-
-      // ArrayBuffer
-      var isAB = false;
-      try { isAB = (init.body instanceof ArrayBuffer) || (pw.ArrayBuffer && init.body instanceof pw.ArrayBuffer); } catch (e) {}
-      if (isAB) {
-        attempts.push('init.body is ArrayBuffer');
-        try {
-          var abt = new TextDecoder().decode(init.body);
-          return { text: abt, attempts: attempts };
-        } catch (e) { attempts.push('ArrayBuffer FAILED: ' + e.message); }
-      }
-
-      // TypedArray
-      try {
-        if (ArrayBuffer.isView && ArrayBuffer.isView(init.body)) {
-          attempts.push('init.body is TypedArray');
-          var tat = new TextDecoder().decode(init.body);
-          return { text: tat, attempts: attempts };
-        }
-      } catch (e) {}
-
-      // toString fallback
-      attempts.push('Trying init.body.toString()...');
-      try {
-        var s = init.body.toString();
-        if (s && s !== '[object Object]' && s !== '[object ReadableStream]') {
-          attempts.push('toString: ' + s.length + ' chars');
-          return { text: s, attempts: attempts };
-        } else {
-          attempts.push('toString unhelpful: "' + s.substring(0, 50) + '"');
-        }
-      } catch (e) { attempts.push('toString FAILED'); }
-    } else {
-      attempts.push('init.body is ' + (init ? describeType(init.body) : 'no init'));
-    }
-
-    // Attempt 3: Read from Request object (input)
-    if (input && typeof input === 'object') {
-      var isRequest = false;
-      try { isRequest = (input instanceof Request); } catch (e) {}
-      if (!isRequest) { try { isRequest = (pw.Request && input instanceof pw.Request); } catch (e) {} }
-      if (!isRequest) { try { isRequest = (typeof input.clone === 'function' && typeof input.text === 'function'); } catch (e) {} }
-
-      if (isRequest) {
-        attempts.push('input is Request, cloning and reading...');
-        try {
-          var cloned = input.clone();
-          var reqText = await cloned.text();
-          attempts.push('Request.text(): ' + reqText.length + ' chars');
-          return { text: reqText, attempts: attempts };
-        } catch (e) { attempts.push('Request.text() FAILED: ' + e.message); }
-
-        // Try arrayBuffer fallback
-        try {
-          var cloned2 = input.clone();
-          var ab = await cloned2.arrayBuffer();
-          var decoded = new TextDecoder().decode(ab);
-          attempts.push('Request.arrayBuffer(): ' + decoded.length + ' chars');
-          return { text: decoded, attempts: attempts };
-        } catch (e) { attempts.push('Request.arrayBuffer() FAILED: ' + e.message); }
-      } else {
-        attempts.push('input is not a Request (type: ' + describeType(input) + ')');
-      }
-    }
-
-    return { text: null, attempts: attempts };
-  }
-
   // ======================== INTERCEPT SETUP ========================
-  var pageWindow = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  var pw = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
 
-  // -------------------- FETCH OVERRIDE --------------------
-  var originalFetch = pageWindow.fetch.bind(pageWindow);
+  LOG('v3.6.0 DIAGNOSTIC — wrapping fetch + XHR on: ' + (typeof unsafeWindow !== 'undefined' ? 'unsafeWindow' : 'window'));
+
+  // -------------------- METHOD 1: FETCH via defineProperty --------------------
+  // Using defineProperty makes the override resilient: even if ChatGPT's code
+  // does "const f = window.fetch" after our script, it gets our wrapper.
+  var realFetch = pw.fetch;
   var fetchCallCount = 0;
 
-  pageWindow.fetch = async function (input, init) {
-    // Get URL from any input type
+  function wrappedFetch(input, init) {
+    // Extract URL
     var url = '';
-    if (typeof input === 'string') {
-      url = input;
-    } else if (input && typeof input === 'object') {
-      try { url = input.url || ''; } catch (e) {}
-    }
-
-    // BROAD MATCH: log anything with "conversation" in URL
-    if (url.indexOf('conversation') === -1) {
-      return originalFetch(input, init);
-    }
+    try {
+      if (typeof input === 'string') url = input;
+      else if (input && input.url) url = input.url;
+      else if (input && input.toString) url = input.toString();
+    } catch (e) {}
 
     fetchCallCount++;
-    var callId = 'F' + fetchCallCount;
+    var id = 'F' + fetchCallCount;
 
-    LOG('========================================');
-    LOG('[' + callId + '] FETCH DETECTED');
-    LOG('[' + callId + '] URL: ' + url);
-    LOG('[' + callId + '] input type: ' + describeType(input));
-    LOG('[' + callId + '] init present: ' + !!init);
+    // LOG EVERY SINGLE FETCH CALL
+    var shortUrl = url.length > 120 ? url.substring(0, 120) + '...' : url;
+    LOG('[' + id + '] FETCH: ' + shortUrl);
+
+    // Only process conversation endpoints
+    if (url.indexOf('conversation') === -1 && url.indexOf('sentinel') === -1 && url.indexOf('chat') === -1) {
+      return realFetch.apply(pw, arguments);
+    }
+
+    LOG('[' + id + '] *** CONVERSATION-RELATED URL DETECTED ***');
+    LOG('[' + id + '] Full URL: ' + url);
+    LOG('[' + id + '] input type: ' + (input ? (input.constructor ? input.constructor.name : typeof input) : 'null'));
+    LOG('[' + id + '] init present: ' + !!init);
     if (init) {
-      LOG('[' + callId + '] init.method: ' + (init.method || 'undefined'));
-      LOG('[' + callId + '] init.body type: ' + describeType(init.body));
-      LOG('[' + callId + '] init keys: ' + Object.keys(init).join(', '));
+      LOG('[' + id + '] init.method: ' + (init.method || 'undefined'));
+      LOG('[' + id + '] init.body type: ' + (init.body == null ? 'null/undefined' : (typeof init.body === 'string' ? 'string(' + init.body.length + ')' : (init.body.constructor ? init.body.constructor.name : typeof init.body))));
+      LOG('[' + id + '] init keys: ' + Object.keys(init).join(', '));
     }
 
-    // Read body
-    var result = await readBodyExhaustive(input, init, pageWindow);
-    LOG('[' + callId + '] Body read attempts:');
-    for (var a = 0; a < result.attempts.length; a++) {
-      LOG('[' + callId + ']   ' + result.attempts[a]);
+    // Determine if POST
+    var method = 'GET';
+    if (init && init.method) method = init.method.toUpperCase();
+    else if (input && input.method) method = input.method.toUpperCase();
+
+    if (method !== 'POST') {
+      LOG('[' + id + '] Method is ' + method + ', not POST — passing through');
+      return realFetch.apply(pw, arguments);
     }
 
-    if (!result.text) {
-      WARN('[' + callId + '] BODY READ FAILED — all attempts exhausted, passing through');
-      LOG('========================================');
-      return originalFetch(input, init);
-    }
+    // Async processing for POST requests
+    return (async function () {
+      // Read body
+      var bodyStr = null;
 
-    LOG('[' + callId + '] Body length: ' + result.text.length);
-    LOG('[' + callId + '] Body preview: ' + result.text.substring(0, 300));
-
-    // Parse JSON
-    var body;
-    try {
-      body = JSON.parse(result.text);
-    } catch (e) {
-      WARN('[' + callId + '] NOT JSON: ' + e.message);
-      LOG('========================================');
-      // Re-send with string body (stream was consumed)
-      var fi = {};
-      if (init) { for (var k in init) { if (k !== 'body') fi[k] = init[k]; } }
-      fi.body = result.text;
-      if (!fi.method) fi.method = 'POST';
-      return originalFetch(url, fi);
-    }
-
-    LOG('[' + callId + '] JSON keys: ' + Object.keys(body).join(', '));
-    LOG('[' + callId + '] action: ' + (body.action === undefined ? 'UNDEFINED' : '"' + body.action + '"'));
-    if (body.messages) {
-      LOG('[' + callId + '] messages: ' + (Array.isArray(body.messages) ? body.messages.length + ' items' : describeType(body.messages)));
-      if (Array.isArray(body.messages)) {
-        for (var mi = 0; mi < body.messages.length; mi++) {
-          var mm = body.messages[mi];
-          var rr = (mm.author && mm.author.role) || mm.role || 'no-role';
-          var preview = '';
-          if (mm.content && mm.content.parts) preview = (mm.content.parts[0] || '').substring(0, 50);
-          else if (mm.content && typeof mm.content === 'string') preview = mm.content.substring(0, 50);
-          LOG('[' + callId + ']   [' + mi + '] role=' + rr + ' content="' + preview + '"');
+      if (init && init.body != null) {
+        if (typeof init.body === 'string') {
+          bodyStr = init.body;
+          LOG('[' + id + '] Body: string (' + bodyStr.length + ' chars)');
+        } else if (init.body.getReader) {
+          LOG('[' + id + '] Body: ReadableStream — reading...');
+          try {
+            var reader = init.body.getReader();
+            var chunks = [];
+            while (true) { var r = await reader.read(); if (r.done) break; chunks.push(r.value); }
+            bodyStr = chunks.map(function (c) { return new TextDecoder().decode(c); }).join('');
+            LOG('[' + id + '] Stream read: ' + bodyStr.length + ' chars');
+          } catch (e) { WARN('[' + id + '] Stream read failed: ' + e.message); }
+        } else if (init.body instanceof Blob || (pw.Blob && init.body instanceof pw.Blob)) {
+          LOG('[' + id + '] Body: Blob — reading...');
+          try { bodyStr = await init.body.text(); } catch (e) { WARN('[' + id + '] Blob read failed'); }
+        } else {
+          LOG('[' + id + '] Body: ' + (init.body.constructor ? init.body.constructor.name : typeof init.body));
+          try { bodyStr = init.body.toString(); } catch (e) {}
         }
       }
-    }
-    if (body.model) LOG('[' + callId + '] model: ' + body.model);
 
-    // Check if this is a primary send (action: "next")
-    var action = body.action === undefined ? '' : body.action;
-    if (action !== 'next') {
-      LOG('[' + callId + '] SKIPPING — action is not "next"');
-      LOG('========================================');
-      var si = {};
-      if (init) { for (var sk in init) { if (sk !== 'body') si[sk] = init[sk]; } }
-      si.body = result.text;
-      if (!si.method) si.method = 'POST';
-      return originalFetch(url, si);
-    }
+      if (!bodyStr && input && typeof input === 'object' && input.clone) {
+        LOG('[' + id + '] Trying Request.clone().text()...');
+        try {
+          bodyStr = await input.clone().text();
+          LOG('[' + id + '] Request body: ' + bodyStr.length + ' chars');
+        } catch (e) { WARN('[' + id + '] Request read failed: ' + e.message); }
+      }
 
-    // === PRIMARY SEND: action:"next" ===
-    LOG('[' + callId + '] *** PRIMARY SEND DETECTED (action:next) ***');
+      if (!bodyStr) {
+        WARN('[' + id + '] No body readable, passing through');
+        return realFetch.apply(pw, [input, init]);
+      }
 
-    var rawUserMessage = extractUserMessage(body);
-    if (!rawUserMessage) {
-      WARN('[' + callId + '] Could not extract user message from payload');
-      LOG('========================================');
-      var ni = {};
-      if (init) { for (var nk in init) { if (nk !== 'body') ni[nk] = init[nk]; } }
-      ni.body = result.text;
-      if (!ni.method) ni.method = 'POST';
-      return originalFetch(url, ni);
-    }
+      LOG('[' + id + '] Body preview: ' + bodyStr.substring(0, 300));
 
-    LOG('[' + callId + '] User message: "' + rawUserMessage.substring(0, 100) + '"');
+      // Parse
+      var body;
+      try { body = JSON.parse(bodyStr); } catch (e) {
+        LOG('[' + id + '] Not JSON, passing through');
+        var fi = {}; if (init) { for (var k in init) { if (k !== 'body') fi[k] = init[k]; } } fi.body = bodyStr; fi.method = 'POST';
+        return realFetch.call(pw, url, fi);
+      }
 
-    // Memory trigger
-    var memResult = parseMemoryTrigger(rawUserMessage);
-    var userMessage = memResult.stripped;
-    var writeMemory = memResult.writeMemory;
+      LOG('[' + id + '] JSON keys: ' + Object.keys(body).join(', '));
+      LOG('[' + id + '] action: ' + (body.action === undefined ? 'UNDEFINED' : '"' + body.action + '"'));
+      if (body.model) LOG('[' + id + '] model: ' + body.model);
 
-    if (writeMemory && body.messages && Array.isArray(body.messages)) {
-      for (var i = body.messages.length - 1; i >= 0; i--) {
-        var msg = body.messages[i];
-        var role = (msg.author && msg.author.role) || msg.role || '';
-        if (role === 'user' && msg.content && msg.content.parts) {
-          msg.content.parts = msg.content.parts.map(function (p) {
-            if (typeof p !== 'string') return p;
-            MEMORY_TOKEN.lastIndex = 0;
-            return p.replace(MEMORY_TOKEN, ' ').replace(/\s{2,}/g, ' ').trim();
-          });
-          break;
+      // Only inject on action:next
+      if (body.action !== 'next') {
+        LOG('[' + id + '] Not action:next, passing through');
+        var si = {}; if (init) { for (var sk in init) { if (sk !== 'body') si[sk] = init[sk]; } } si.body = bodyStr; si.method = 'POST';
+        return realFetch.call(pw, url, si);
+      }
+
+      LOG('[' + id + '] *** ACTION:NEXT — PROCESSING ***');
+
+      var rawMsg = extractUserMessage(body);
+      if (!rawMsg) {
+        WARN('[' + id + '] User message extraction failed');
+        try { LOG('[' + id + '] Payload dump: ' + JSON.stringify(body).substring(0, 600)); } catch (e) {}
+        var ei = {}; if (init) { for (var ek in init) { if (ek !== 'body') ei[ek] = init[ek]; } } ei.body = bodyStr; ei.method = 'POST';
+        return realFetch.call(pw, url, ei);
+      }
+
+      LOG('[' + id + '] User message: "' + rawMsg.substring(0, 100) + '"');
+
+      var mem = parseMemoryTrigger(rawMsg);
+
+      try {
+        LOG('[' + id + '] Calling backend...');
+        var context = await fetchContext(mem.stripped, mem.writeMemory);
+
+        body.messages.unshift({
+          id: uuidv4(),
+          author: { role: 'system' },
+          content: { content_type: 'text', parts: [context] },
+          metadata: {},
+        });
+
+        var newInit = { method: 'POST', body: JSON.stringify(body) };
+        if (init) {
+          if (init.headers) newInit.headers = init.headers;
+          if (init.credentials) newInit.credentials = init.credentials;
+          if (init.signal) newInit.signal = init.signal;
+          if (init.mode) newInit.mode = init.mode;
+          if (init.cache) newInit.cache = init.cache;
+          if (init.redirect) newInit.redirect = init.redirect;
+          if (init.referrer) newInit.referrer = init.referrer;
+          if (init.referrerPolicy) newInit.referrerPolicy = init.referrerPolicy;
+          if (init.integrity) newInit.integrity = init.integrity;
+          if (init.keepalive != null) newInit.keepalive = init.keepalive;
         }
+
+        LOG('[' + id + '] INJECTION SUCCESS (' + context.length + ' chars)');
+        return realFetch.call(pw, url, newInit);
+      } catch (err) {
+        WARN('[' + id + '] Backend failed (' + err.message + ') — fail-safe');
+        var fi2 = {}; if (init) { for (var fk in init) { if (fk !== 'body') fi2[fk] = init[fk]; } } fi2.body = bodyStr; fi2.method = 'POST';
+        return realFetch.call(pw, url, fi2);
       }
-      LOG('[' + callId + '] /remember stripped');
-    }
+    })();
+  }
 
-    // Fetch context and inject
-    try {
-      var context = await fetchContext(userMessage, writeMemory);
+  // Apply fetch override using multiple methods for maximum coverage
+  try {
+    pw.fetch = wrappedFetch;
+    LOG('fetch override applied (direct assignment)');
+  } catch (e) {
+    WARN('Direct fetch assignment failed: ' + e.message);
+  }
 
-      var systemMessage = {
-        id: uuidv4(),
-        author: { role: 'system' },
-        content: { content_type: 'text', parts: [context] },
-        metadata: {},
-      };
+  // Also try defineProperty to make it stick
+  try {
+    Object.defineProperty(pw, 'fetch', {
+      value: wrappedFetch,
+      writable: true,
+      configurable: true,
+    });
+    LOG('fetch override applied (defineProperty)');
+  } catch (e) {
+    WARN('defineProperty failed: ' + e.message);
+  }
 
-      if (body.messages && Array.isArray(body.messages)) {
-        body.messages.unshift(systemMessage);
-      } else {
-        body.messages = [systemMessage];
-      }
-
-      var modifiedBody = JSON.stringify(body);
-      var newInit = { method: 'POST', body: modifiedBody };
-      if (init) {
-        if (init.headers) newInit.headers = init.headers;
-        if (init.credentials) newInit.credentials = init.credentials;
-        if (init.signal) newInit.signal = init.signal;
-        if (init.mode) newInit.mode = init.mode;
-        if (init.cache) newInit.cache = init.cache;
-        if (init.redirect) newInit.redirect = init.redirect;
-        if (init.referrer) newInit.referrer = init.referrer;
-        if (init.referrerPolicy) newInit.referrerPolicy = init.referrerPolicy;
-        if (init.integrity) newInit.integrity = init.integrity;
-        if (init.keepalive != null) newInit.keepalive = init.keepalive;
-      }
-
-      LOG('[' + callId + '] INJECTION SUCCESS (' + context.length + ' chars)');
-      LOG('========================================');
-      return originalFetch(url, newInit);
-    } catch (err) {
-      WARN('[' + callId + '] Backend failed (' + err.message + ') — fail-safe');
-      LOG('========================================');
-    }
-
-    // Fail-safe: send with original body string
-    var fallback = {};
-    if (init) { for (var fk in init) { if (fk !== 'body') fallback[fk] = init[fk]; } }
-    fallback.body = result.text;
-    if (!fallback.method) fallback.method = 'POST';
-    return originalFetch(url, fallback);
-  };
-
-  // -------------------- XHR OVERRIDE --------------------
-  var OrigXHR = pageWindow.XMLHttpRequest;
-  var xhrProto = OrigXHR.prototype;
+  // -------------------- METHOD 2: XHR OVERRIDE --------------------
+  var xhrProto = pw.XMLHttpRequest.prototype;
   var origOpen = xhrProto.open;
   var origSend = xhrProto.send;
   var xhrCallCount = 0;
 
   xhrProto.open = function (method, url) {
-    this._bridgeMethod = method;
-    this._bridgeUrl = url;
+    this._bMethod = method;
+    this._bUrl = url;
+
+    // Log conversation-related XHR
+    if (url && (url.indexOf('conversation') !== -1 || url.indexOf('sentinel') !== -1)) {
+      xhrCallCount++;
+      this._bId = 'X' + xhrCallCount;
+      LOG('[' + this._bId + '] XHR OPEN: ' + method + ' ' + url);
+    }
+
     return origOpen.apply(this, arguments);
   };
 
   xhrProto.send = function (body) {
     var xhr = this;
-    var url = xhr._bridgeUrl || '';
+    var url = xhr._bUrl || '';
 
-    if (url.indexOf('conversation') === -1) {
+    if (url.indexOf('conversation') === -1 && url.indexOf('sentinel') === -1) {
       return origSend.apply(xhr, arguments);
     }
 
-    xhrCallCount++;
-    var callId = 'X' + xhrCallCount;
-    var method = (xhr._bridgeMethod || '').toUpperCase();
+    var id = xhr._bId || ('X' + (++xhrCallCount));
+    var method = (xhr._bMethod || '').toUpperCase();
 
-    LOG('========================================');
-    LOG('[' + callId + '] XHR DETECTED');
-    LOG('[' + callId + '] URL: ' + url);
-    LOG('[' + callId + '] Method: ' + method);
-    LOG('[' + callId + '] Body type: ' + describeType(body));
+    LOG('[' + id + '] XHR SEND: ' + method + ' ' + url);
+    LOG('[' + id + '] body type: ' + (body == null ? 'null' : typeof body));
     if (typeof body === 'string') {
-      LOG('[' + callId + '] Body length: ' + body.length);
-      LOG('[' + callId + '] Body preview: ' + body.substring(0, 300));
+      LOG('[' + id + '] body length: ' + body.length);
+      LOG('[' + id + '] body preview: ' + body.substring(0, 300));
     }
 
     if (method !== 'POST' || typeof body !== 'string') {
-      LOG('[' + callId + '] Not a POST with string body, passing through');
-      LOG('========================================');
       return origSend.apply(xhr, arguments);
     }
 
-    // Try to parse and check action
     var parsed;
     try { parsed = JSON.parse(body); } catch (e) {
-      LOG('[' + callId + '] Not JSON, passing through');
-      LOG('========================================');
-      return origSend.apply(xhr, arguments);
-    }
-
-    LOG('[' + callId + '] JSON keys: ' + Object.keys(parsed).join(', '));
-    LOG('[' + callId + '] action: ' + (parsed.action === undefined ? 'UNDEFINED' : '"' + parsed.action + '"'));
-
-    if (parsed.action !== 'next') {
-      LOG('[' + callId + '] Not action:next, passing through');
-      LOG('========================================');
       return origSend.call(xhr, body);
     }
 
-    LOG('[' + callId + '] *** PRIMARY SEND (XHR, action:next) ***');
+    LOG('[' + id + '] action: ' + (parsed.action || 'undefined'));
 
+    if (parsed.action !== 'next') {
+      return origSend.call(xhr, body);
+    }
+
+    LOG('[' + id + '] *** XHR ACTION:NEXT ***');
     var rawMsg = extractUserMessage(parsed);
-    LOG('[' + callId + '] User message: "' + (rawMsg || 'NOT FOUND').substring(0, 100) + '"');
-
     if (!rawMsg) {
-      LOG('========================================');
+      WARN('[' + id + '] Extraction failed');
       return origSend.call(xhr, body);
     }
 
     var mem = parseMemoryTrigger(rawMsg);
-
     fetchContext(mem.stripped, mem.writeMemory).then(function (context) {
-      var sysMsg = {
-        id: uuidv4(),
-        author: { role: 'system' },
-        content: { content_type: 'text', parts: [context] },
-        metadata: {},
-      };
-      if (parsed.messages && Array.isArray(parsed.messages)) {
-        parsed.messages.unshift(sysMsg);
-      } else {
-        parsed.messages = [sysMsg];
-      }
-      LOG('[' + callId + '] INJECTION SUCCESS (XHR, ' + context.length + ' chars)');
-      LOG('========================================');
+      parsed.messages.unshift({
+        id: uuidv4(), author: { role: 'system' },
+        content: { content_type: 'text', parts: [context] }, metadata: {},
+      });
+      LOG('[' + id + '] XHR INJECTION SUCCESS');
       origSend.call(xhr, JSON.stringify(parsed));
     }).catch(function (err) {
-      WARN('[' + callId + '] Backend failed: ' + err.message + ' — fail-safe');
-      LOG('========================================');
+      WARN('[' + id + '] Backend failed — fail-safe');
       origSend.call(xhr, body);
     });
   };
 
-  LOG('v3.5.0 loaded — aggressive extraction for all model payloads');
-  LOG('Watching: fetch + XHR, filter: action:next');
-  LOG('Memory gate: /remember triggers write');
+  // -------------------- METHOD 3: SERVICE WORKER CHECK --------------------
+  if (pw.navigator && pw.navigator.serviceWorker) {
+    LOG('Service Worker controller: ' + (pw.navigator.serviceWorker.controller ? 'ACTIVE (' + pw.navigator.serviceWorker.controller.scriptURL + ')' : 'none'));
+    pw.navigator.serviceWorker.addEventListener('controllerchange', function () {
+      LOG('Service Worker controller CHANGED: ' + (pw.navigator.serviceWorker.controller ? pw.navigator.serviceWorker.controller.scriptURL : 'none'));
+    });
+  }
+
+  // -------------------- METHOD 4: Also wrap on sandbox window --------------------
+  // In case some code goes through the sandbox's fetch
+  if (pw !== window) {
+    try {
+      var sandboxRealFetch = window.fetch;
+      window.fetch = function () {
+        var url = '';
+        try {
+          if (typeof arguments[0] === 'string') url = arguments[0];
+          else if (arguments[0] && arguments[0].url) url = arguments[0].url;
+        } catch (e) {}
+        if (url.indexOf('conversation') !== -1 || url.indexOf('sentinel') !== -1) {
+          LOG('[SANDBOX] fetch detected: ' + url);
+        }
+        return sandboxRealFetch.apply(window, arguments);
+      };
+      LOG('Sandbox window.fetch also wrapped');
+    } catch (e) {}
+  }
+
+  LOG('v3.6.0 ready — logging ALL fetch/XHR URLs. Send a message and check console.');
 })();
