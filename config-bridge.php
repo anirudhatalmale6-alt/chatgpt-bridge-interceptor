@@ -15,4 +15,16 @@ return [
 
     'identity_block' => env('BRIDGE_IDENTITY_BLOCK', ''),
 
+    /*
+     * Single-tenant fallback agent scope. Used by ApiMemoryController to scope
+     * BOTH memory reads and writes when the X-Agent-Key middleware does not set
+     * an 'agent_id' request attribute and there is no auth() session — which is
+     * the case for the bridge's server-to-server calls.
+     *
+     * Reads and writes MUST resolve to the same value or they will silently
+     * miss each other. Leave as-is for single-tenant. For multi-tenant, set the
+     * agent_id in the middleware instead and set this to null to force scoping.
+     */
+    'default_agent_id' => env('BRIDGE_DEFAULT_AGENT_ID', 'bridge-user'),
+
 ];
