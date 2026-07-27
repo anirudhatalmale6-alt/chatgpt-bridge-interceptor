@@ -1,0 +1,48 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Midnight Switchboard",
+    "description": "Context pipeline: authoritative clock, identity, and memory for the assistant.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "https://midnightswitchboard.net" }
+  ],
+  "paths": {
+    "/api/time/status": {
+      "get": {
+        "operationId": "getClock",
+        "summary": "Get the current authoritative server time and temporal context.",
+        "description": "Returns the current date, time, weekday, week number, season, and part of day in the system timezone (America/New_York). Call this to ground yourself in the present moment before responding.",
+        "responses": {
+          "200": {
+            "description": "Current time and temporal context.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Missing or invalid X-Agent-Key."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "AgentKey": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-Agent-Key"
+      }
+    }
+  },
+  "security": [
+    { "AgentKey": [] }
+  ]
+}
